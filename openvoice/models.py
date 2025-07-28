@@ -10,7 +10,7 @@ from openvoice import attentions
 from torch.nn import Conv1d, ConvTranspose1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 
-from openvoice.commons import init_weights, get_padding
+from openvoice.commons import init_weights, get_padding, sequence_mask
 
 
 class TextEncoder(nn.Module):
@@ -362,6 +362,42 @@ class ReferenceEncoder(nn.Module):
         for i in range(n_convs):
             L = (L - kernel_size + 2 * pad) // stride + 1
         return L
+
+    def infer(self, inputs, lengths=None):
+        N = inputs.size(0)
+
+        out = inputs.view(N, 1, -1, self.spec_channels)  # [N, 1, Ty, n_freqs]
+        if self.layernorm is not None:
+            out = self.layernorm(out)
+
+        if lengths is not None:
+            out = out * sequence_mask(lengths, out.shape[2]).view(N, 1, -1, 1)
+
+        for conv in self.convs:
+            out = conv(out)
+            # out = wn(out)
+            out = F.relu(out)  # [N, 128, Ty//2^K, n_mels//2^K]
+            
+            if lengths is not None:
+                lengths = (lengths - 3 + 2 * 1) // 2 + 1
+                out = out * sequence_mask(lengths, out.shape[2]).view(N, 1, -1, 1)
+
+        out = out.transpose(1, 2)  # [N, Ty//2^K, 128, n_mels//2^K]
+        T = out.size(1)
+        N = out.size(0)
+        out = out.contiguous().view(N, T, -1)  # [N, Ty//2^K, 128*n_mels//2^K]
+
+        self.gru.flatten_parameters()
+        memory, out = self.gru(out)  # memory [N, T, 128], out [1, N, 128], memory[:,-1,:] is out[0]
+
+        if lengths is not None:
+            out = torch.index_select(
+                memory.reshape(N * T, -1),
+                0,
+                torch.arange(N) * T + lengths - 1
+            ).view(1, N, -1)
+
+        return self.proj(out.squeeze(0)) 
 
 
 class ResidualCouplingBlock(nn.Module):

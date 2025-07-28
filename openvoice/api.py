@@ -9,6 +9,8 @@ import librosa
 from openvoice.text import text_to_sequence
 from openvoice.mel_processing import spectrogram_torch
 from openvoice.models import SynthesizerTrn
+from functools import lru_cache
+from torch.nn.utils.rnn import pad_sequence
 
 
 class OpenVoiceBaseClass(object):
@@ -199,4 +201,59 @@ class ToneColorConverter(OpenVoiceBaseClass):
         bits = np.stack(bits).reshape(-1, 8)
         message = utils.bits_to_string(bits)
         return message
-    
+
+
+class ToneColorConverterForBatchInference(ToneColorConverter):
+    @lru_cache()
+    def load_audio_and_calc_spec(self, audio_path: str):
+        hps = self.hps
+        audio, sample_rate = librosa.load(audio_path, sr=hps.data.sampling_rate)
+        audio = torch.tensor(audio, device=self.device).float()
+        
+        spectrogram = spectrogram_torch(
+            audio.unsqueeze(0), hps.data.filter_length,
+            hps.data.sampling_rate, hps.data.hop_length, hps.data.win_length,
+            center=False
+        ).to(self.device).squeeze(0).transpose(0, 1)
+
+        return audio, spectrogram # audio [T_audio] , spectrogram [n_mels, T_spec]
+
+    @torch.inference_mode()
+    def extract_se_batch(self, ref_wav_list:list[str]):
+        inputs, lengths = [], []
+        for audio_path in ref_wav_list:
+            audio, spec = self.load_audio_and_calc_spec(audio_path)
+
+            inputs.append(spec)
+            lengths.append(spec.shape[0])
+
+        inputs = pad_sequence(inputs, batch_first=True)
+        lengths = torch.tensor(lengths, dtype=torch.int64, device=self.device)
+
+        gs = self.model.ref_enc.infer(inputs, lengths).unsqueeze(-1)
+        
+        return gs # [N, 256, 1], N=len(ref_wav_list)
+
+    @torch.inference_mode()
+    def convert_batch(self, audio_src_paths:list[str], src_ses, tgt_ses, output_paths:list[str]=None, tau=0.3):
+        audio_lengths, specs, spec_lengths = [], [], []
+        for audio_path in audio_src_paths:
+            audio, spec = self.load_audio_and_calc_spec(audio_path)
+            audio_lengths.append(audio.shape[0])
+            specs.append(spec)
+            spec_lengths.append(spec.shape[0])
+        
+        specs = pad_sequence(specs, True).transpose(1,2)
+        spec_lengths = torch.tensor(spec_lengths, dtype=torch.int64, device=self.device)
+
+        converted_audios = self.model.voice_conversion(
+            specs, spec_lengths, sid_src=src_ses, sid_tgt=tgt_ses, tau=tau
+        )[0].squeeze(1).data.cpu().float().numpy()
+
+        if output_paths is not None:
+            for converted_audio, audio_length, output_path in zip(converted_audios, audio_lengths, output_paths):
+                converted_audio = converted_audio[:audio_length]
+                soundfile.write(output_path, converted_audio, self.hps.data.sampling_rate)
+        else:
+            return [converted_audio[:audio_length] for converted_audio, audio_length in zip(converted_audios, audio_lengths)]
+            
